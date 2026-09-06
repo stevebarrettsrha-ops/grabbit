@@ -1,0 +1,5 @@
+flask>=3.0
+# yt-dlp changes constantly as sites update; install the latest with the
+# recommended extras (certifi, brotli, websockets, requests).
+# Keep it fresh with:  pip install -U --pre "yt-dlp[default]"
+yt-dlp[default]
