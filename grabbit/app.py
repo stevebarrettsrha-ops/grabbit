@@ -183,7 +183,7 @@ def api_info():
 
     # --- a playlist / channel ---
     if info.get("_type") == "playlist":
-        entries = [e for e in (info.get("entries") or []) if e]
+        entries = _flatten_entries(info.get("entries"))
         if not entries:
             return jsonify(error="That playlist looks empty or private."), 400
         first = entries[0]
@@ -201,6 +201,7 @@ def api_info():
             thumbnail=_best_thumb(first) or _best_thumb(info),
             first_title=first.get("title"),
             single_available=single_available,
+            entries=[_entry_summary(e, i) for i, e in enumerate(entries, 1)],
             has_chapters=False,
             chapters=[],
         )
@@ -228,6 +229,41 @@ def api_info():
     )
 
 
+def _flatten_entries(entries):
+    """List every video in a playlist/channel, opening nested lists (e.g. a
+    channel's Videos / Shorts / Live tabs) so they read as one list."""
+    out = []
+    for e in entries or []:
+        if not e:
+            continue
+        if e.get("_type") == "playlist" or isinstance(e.get("entries"), list):
+            out.extend(_flatten_entries(e.get("entries")))
+        else:
+            out.append(e)
+    return out
+
+
+def _small_thumb(e):
+    """A thumbnail small enough for a list row."""
+    thumbs = [t for t in (e.get("thumbnails") or []) if t.get("url")]
+    sized = [t for t in thumbs if (t.get("width") or 0) >= 160]
+    if sized:
+        return min(sized, key=lambda t: t["width"])["url"]
+    return thumbs[-1]["url"] if thumbs else e.get("thumbnail")
+
+
+def _entry_summary(e, position):
+    url = e.get("webpage_url") or e.get("url") or ""
+    return {
+        # Number by place in the combined list; a channel's tabs each count from 1.
+        "index": position,
+        "url": url if re.match(r"^https?://", url, re.I) else "",
+        "title": e.get("title") or f"Video {position}",
+        "duration": human_duration(e.get("duration")),
+        "thumbnail": _small_thumb(e),
+    }
+
+
 # --------------------------------------------------------------------------- #
 #  Download
 # --------------------------------------------------------------------------- #
@@ -243,6 +279,11 @@ def api_download():
     filename = data.get("filename")  # only used for direct downloads
     if not url:
         return jsonify(error="Missing URL."), 400
+    items = []
+    if scope == "selected":
+        items = _clean_items(data.get("items"))
+        if not items:
+            return jsonify(error="Pick at least one video."), 400
 
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
@@ -256,11 +297,17 @@ def api_download():
             "error": None,
             "result_path": None,
             "download_name": None,
+            "warning": None,
         }
+        if scope == "selected" and data.get("title"):
+            JOBS[job_id]["title"] = str(data["title"])
 
     if mode == "direct":
         target = _run_direct
         args = (job_id, url, filename)
+    elif scope == "selected":
+        target = _run_selected
+        args = (job_id, url, items, mode, quality, codec)
     else:
         target = _run_download
         args = (job_id, url, mode, quality, scope, playlist_count, codec)
@@ -325,21 +372,8 @@ def _run_download(job_id, url, mode, quality, scope="single", playlist_count=0, 
     if FFMPEG_DIR:
         opts["ffmpeg_location"] = FFMPEG_DIR
 
-    if mode == "audio":
-        opts["format"] = "ba/b"
-        opts["postprocessors"] = [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
-        ]
-    else:
-        fmt_map = QUALITY_RAW if codec == "quality" else QUALITY_FORMATS
-        opts["format"] = fmt_map.get(quality, fmt_map["best"])
-        opts["merge_output_format"] = "mp4"
-        # Chapter-splitting only applies to a single video.
-        if mode == "chapters" and not is_playlist:
-            opts["outtmpl"]["chapter"] = "%(section_number)03d - %(section_title).150B.%(ext)s"
-            opts["postprocessors"] = [{"key": "FFmpegSplitChapters", "force_keyframes": False}]
-        else:  # plain video: embed chapter markers if present
-            opts["postprocessors"] = [{"key": "FFmpegMetadata", "add_chapters": True}]
+    # Chapter-splitting only applies to a single video.
+    _apply_media_opts(opts, mode, quality, codec, split_chapters=not is_playlist)
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -356,6 +390,127 @@ def _run_download(job_id, url, mode, quality, scope="single", playlist_count=0, 
         _fail(job_id, _clean_err(exc))
     except Exception as exc:  # noqa: BLE001
         _fail(job_id, str(exc))
+
+
+def _apply_media_opts(opts, mode, quality, codec, split_chapters=False):
+    """Set yt-dlp's format and post-processing for the chosen mode."""
+    if mode == "audio":
+        opts["format"] = "ba/b"
+        opts["postprocessors"] = [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+        ]
+        return
+    fmt_map = QUALITY_RAW if codec == "quality" else QUALITY_FORMATS
+    opts["format"] = fmt_map.get(quality, fmt_map["best"])
+    opts["merge_output_format"] = "mp4"
+    if mode == "chapters" and split_chapters:
+        opts["outtmpl"]["chapter"] = "%(section_number)03d - %(section_title).150B.%(ext)s"
+        opts["postprocessors"] = [{"key": "FFmpegSplitChapters", "force_keyframes": False}]
+    else:  # plain video: embed chapter markers if present
+        opts["postprocessors"] = [{"key": "FFmpegMetadata", "add_chapters": True}]
+
+
+# --------------------------------------------------------------------------- #
+#  Download only the videos the user picked from a playlist / channel
+# --------------------------------------------------------------------------- #
+def _clean_items(raw):
+    """Keep well-formed picks: each needs a web link or a playlist position."""
+    items = []
+    for it in raw if isinstance(raw, list) else []:
+        if not isinstance(it, dict):
+            continue
+        link = str(it.get("url") or "").strip()
+        try:
+            index = int(it.get("index") or 0)
+        except (TypeError, ValueError):
+            index = 0
+        if not re.match(r"^https?://", link, re.I):
+            link = ""
+        if link or index > 0:
+            items.append({"url": link, "index": index, "title": str(it.get("title") or "")})
+    return items
+
+
+def _run_selected(job_id, list_url, items, mode, quality, codec):
+    job_dir = DOWNLOAD_ROOT / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    total = len(items)
+    state = {"n": 0}  # which pick (1-based) is downloading now
+
+    def hook(d):
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                return
+            n = state["n"]
+            if d["status"] == "downloading":
+                size = d.get("total_bytes") or d.get("total_bytes_estimate")
+                done = d.get("downloaded_bytes") or 0
+                frac = done / size if size else 0
+                spd = d.get("speed")
+                job["speed"] = f"{spd / 1_048_576:.1f} MB/s" if spd else None
+                eta = d.get("eta")
+                job["eta"] = f"{int(eta)}s" if eta else None
+                job["status"] = "downloading"
+                job["progress"] = round(min(((n - 1) + frac) / total * 100, 99.0), 1)
+                job["phase"] = f"Downloading video {n} of {total}…"
+            elif d["status"] == "finished":
+                job["phase"] = f"Processing video {n} of {total}…"
+
+    failed = []
+    for n, item in enumerate(items, 1):
+        state["n"] = n
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                return
+            job["status"] = "downloading"
+            job["phase"] = f"Starting video {n} of {total}…"
+            job["progress"] = round((n - 1) / total * 100, 1)
+
+        # Number files by their place in the channel so the zip keeps its order.
+        prefix = f"{item['index']:03d}" if item["index"] else f"{n:03d}"
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "progress_hooks": [hook],
+            "paths": {"home": str(job_dir)},
+            "outtmpl": {"default": f"{prefix} - %(title).180B.%(ext)s"},
+            "restrictfilenames": False,
+            "windowsfilenames": True,
+        }
+        if item["url"]:
+            target, opts["noplaylist"] = item["url"], True
+        else:  # no direct link for this entry: fetch it by its playlist position
+            target, opts["noplaylist"] = list_url, False
+            opts["playlist_items"] = str(item["index"])
+        if FFMPEG_DIR:
+            opts["ffmpeg_location"] = FFMPEG_DIR
+        _apply_media_opts(opts, mode, quality, codec)
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(target, download=True)
+        except Exception as exc:  # noqa: BLE001 — one bad video shouldn't stop the rest
+            failed.append(item["title"] or f"video {n}")
+            print(f"  ⚠  Skipped {item['title'] or target}: {_clean_err(exc)}")
+
+    if len(failed) == total:
+        _fail(job_id, "None of the chosen videos could be downloaded.")
+        return
+    if failed:
+        with JOBS_LOCK:
+            JOBS[job_id]["warning"] = (
+                f"{len(failed)} of {total} videos could not be downloaded and were skipped."
+            )
+
+    if codec == "force_h264" and mode != "audio":
+        _force_h264_dir(job_id, job_dir)
+
+    title = "selected videos"
+    with JOBS_LOCK:
+        title = JOBS[job_id].get("title") or title
+    _finalize(job_id, job_dir, mode, title, "playlist")
 
 
 def _finalize(job_id, job_dir, mode, title, scope="single"):
@@ -834,6 +989,30 @@ PAGE = r"""<!doctype html>
     background:#13150f;border-radius:8px;border:1px solid var(--line)}
   .chrow .t{color:var(--muted);font-family:"IBM Plex Mono",monospace}
 
+  .picker{display:grid;gap:9px}
+  .picker.hide{display:none}
+  .ptools{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .ptools input[type=search]{
+    flex:1;min-width:150px;background:#13150f;border:1px solid var(--line);color:var(--ink);
+    border-radius:10px;padding:8px 12px;font-family:"IBM Plex Mono",monospace;font-size:12.5px;outline:none
+  }
+  .ptools input[type=search]:focus{border-color:var(--accent)}
+  .ghost{padding:8px 12px;font-size:12.5px;color:var(--ink);background:#13150f;border:1px solid var(--line)}
+  .ghost:hover{border-color:var(--accent)}
+  .pcount{font-family:"IBM Plex Mono",monospace;font-size:11.5px;color:var(--muted);margin-left:auto}
+  .vlist{display:grid;gap:5px;max-height:380px;overflow:auto;padding-right:2px}
+  .vrow{display:flex;align-items:center;gap:10px;padding:6px 10px;background:#13150f;
+    border:1px solid var(--line);border-radius:9px;cursor:pointer;font-size:13px;user-select:none}
+  .vrow:hover{border-color:#3d4136}
+  .vrow.on{border-color:rgba(233,196,106,.55);background:rgba(233,196,106,.06)}
+  .vrow input{accent-color:var(--accent);width:16px;height:16px;flex:none;margin:0;cursor:pointer}
+  .vrow img,.vrow .noimg{width:64px;height:36px;flex:none;border-radius:5px;object-fit:cover;background:#0c0d0b}
+  .vrow .vt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .vrow .vn,.vrow .vd{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--muted);flex:none}
+  .vrow .vn{width:34px}
+  .vempty{padding:12px;text-align:center;color:var(--muted);font-size:12.5px}
+  .warn{color:var(--accent2)}
+
   .actions{border-top:1px solid var(--line);padding:16px;display:flex;gap:12px;align-items:center}
   .dl{padding:13px 24px;color:#1b1c18;background:linear-gradient(95deg,var(--accent),var(--accent2))}
   .dl:hover{filter:brightness(1.06)}
@@ -862,7 +1041,7 @@ PAGE = r"""<!doctype html>
     <div class="logo"><span class="paw">🐰</span> Grabbit</div>
     <div class="tag">// yt-dlp · 1,800+ sites</div>
   </header>
-  <p class="sub">Paste a link from <b>Internet Archive</b>, <b>YouTube</b>, <b>Vimeo</b>, <b>Wikimedia</b> — a single video, a whole <b>playlist</b>, any page with video, or a <b>direct file link</b>. Grab full videos, split into <b>chapters</b>, or pull <b>audio</b> only.</p>
+  <p class="sub">Paste a link from <b>Internet Archive</b>, <b>YouTube</b>, <b>Vimeo</b>, <b>Wikimedia</b> — a single video, a whole <b>playlist</b> or <b>channel</b> (pick just the videos you want), any page with video, or a <b>direct file link</b>. Grab full videos, split into <b>chapters</b>, or pull <b>audio</b> only.</p>
 
   <div class="bar">
     <input id="url" type="url" placeholder="https://archive.org/details/…   ·   any video page   ·   https://site.com/clip.mp4" autocomplete="off" spellcheck="false">
@@ -989,16 +1168,31 @@ function render(url, d){
 
 function renderPlaylist(url, d){
   const n = d.playlist.count;
+  const entries = d.entries || [];
+  // Small lists start fully ticked; big channels start empty so nothing huge
+  // downloads by accident.
+  const startAll = entries.length <= 50;
+  const picked = new Set(startAll ? entries.map((_, i) => i) : []);
+
   const scopeBlock = d.single_available ? `
       <div>
         <div class="label">How much</div>
         <div class="modes">
-          <label class="mode"><input type="radio" name="scope" value="playlist" checked>
-            <span>Whole playlist<small>${n} videos</small></span></label>
+          <label class="mode"><input type="radio" name="scope" value="pick" checked>
+            <span>Choose videos<small>${n} in list</small></span></label>
           <label class="mode"><input type="radio" name="scope" value="single">
             <span>This video only<small>1 video</small></span></label>
         </div>
-      </div>` : `<input type="hidden" name="scope" value="playlist">`;
+      </div>` : "";
+
+  const rows = entries.map((e, i) => `
+      <label class="vrow" data-i="${i}">
+        <input type="checkbox" data-i="${i}">
+        <span class="vn">${e.index}</span>
+        ${e.thumbnail ? `<img src="${esc(e.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : `<span class="noimg"></span>`}
+        <span class="vt" title="${esc(e.title)}">${esc(e.title)}</span>
+        <span class="vd">${e.duration || ""}</span>
+      </label>`).join("");
 
   result.innerHTML = `
   <div class="card">
@@ -1017,6 +1211,16 @@ function renderPlaylist(url, d){
     </div>
     <div class="opts">
       ${scopeBlock}
+      <div class="picker" id="picker">
+        <div class="label" style="margin:0">Pick the videos you want</div>
+        <div class="ptools">
+          <input type="search" id="vfilter" placeholder="Search titles…">
+          <button class="ghost" id="vall">Select all</button>
+          <button class="ghost" id="vnone">Clear</button>
+          <span class="pcount" id="pcount"></span>
+        </div>
+        <div class="vlist" id="vlist">${rows || `<div class="vempty">No videos listed.</div>`}</div>
+      </div>
       <div>
         <div class="label">What to grab</div>
         <div class="modes">
@@ -1056,22 +1260,83 @@ function renderPlaylist(url, d){
     </div>
   </div>`;
 
+  const list = $("#vlist"), dl = $("#dl"), picker = $("#picker"), filter = $("#vfilter");
+  const boxes = [...list.querySelectorAll("input[type=checkbox]")];
+  const rowsEl = [...list.querySelectorAll(".vrow")];
+  let last = null;
+
+  const scopeNow = () => {
+    const c = document.querySelector('input[name=scope]:checked');
+    return c ? c.value : "pick";
+  };
+  const visible = () => rowsEl.filter(r => r.style.display !== "none").map(r => +r.dataset.i);
+
+  function refresh(){
+    boxes.forEach((b, i) => { b.checked = picked.has(i); rowsEl[i].classList.toggle("on", b.checked); });
+    const k = picked.size;
+    $("#pcount").textContent = `${k} of ${entries.length} selected`;
+    const single = scopeNow() === "single";
+    picker.classList.toggle("hide", single);
+    if (!dl.dataset.busy){
+      dl.disabled = !single && k === 0;
+      dl.textContent = single ? "Download" : k === 0 ? "Pick videos" : `Download ${k} video${k === 1 ? "" : "s"}`;
+    }
+  }
+
+  // Shift-click ticks (or unticks) every visible row between the two clicks.
+  list.addEventListener("click", ev => {
+    const row = ev.target.closest(".vrow");
+    if (!row) return;
+    ev.preventDefault();
+    const i = +row.dataset.i;
+    const turnOn = !picked.has(i);
+    if (ev.shiftKey && last !== null){
+      const vis = visible();
+      const a = vis.indexOf(last), b = vis.indexOf(i);
+      if (a !== -1 && b !== -1){
+        vis.slice(Math.min(a, b), Math.max(a, b) + 1).forEach(j => turnOn ? picked.add(j) : picked.delete(j));
+      }
+    } else {
+      turnOn ? picked.add(i) : picked.delete(i);
+    }
+    last = i;
+    refresh();
+  });
+
+  filter.addEventListener("input", () => {
+    const q = filter.value.trim().toLowerCase();
+    rowsEl.forEach((r, i) => { r.style.display = !q || entries[i].title.toLowerCase().includes(q) ? "" : "none"; });
+  });
+  // "Select all" / "Clear" act on what the search is currently showing.
+  $("#vall").onclick = () => { visible().forEach(i => picked.add(i)); refresh(); };
+  $("#vnone").onclick = () => { visible().forEach(i => picked.delete(i)); refresh(); };
+  document.querySelectorAll('input[name=scope]').forEach(r => r.addEventListener("change", refresh));
+
   const qrow = $("#qrow");
   document.querySelectorAll('input[name=mode]').forEach(r =>
     r.addEventListener("change", () => {
       qrow.classList.toggle("hide", document.querySelector('input[name=mode]:checked').value === "audio");
     }));
-  $("#dl").onclick = () => {
-    const checked = document.querySelector('input[name=scope]:checked');
-    const scope = checked ? checked.value : "playlist";
-    startDownload(url, {
+
+  dl.onclick = () => {
+    const base = {
       mode: document.querySelector('input[name=mode]:checked').value,
       quality: $("#quality").value,
       codec: $("#codec").value,
-      scope: scope,
-      playlist_count: n,
+    };
+    if (scopeNow() === "single") return startDownload(url, {...base, scope: "single"});
+    const chosen = [...picked].sort((a, b) => a - b).map(i => entries[i]);
+    if (!chosen.length) return;
+    // Everything ticked: grab the list in one go, as before.
+    if (chosen.length === entries.length && entries.length === n)
+      return startDownload(url, {...base, scope: "playlist", playlist_count: n});
+    startDownload(url, {
+      ...base, scope: "selected", title: d.title,
+      items: chosen.map(e => ({url: e.url, index: e.index, title: e.title})),
     });
   };
+
+  refresh();
 }
 
 function renderDirect(url, d){
@@ -1101,7 +1366,7 @@ function renderDirect(url, d){
 
 async function startDownload(url, extra){
   const dl = $("#dl"), prog = $("#prog"), fill = $("#fill"), phase = $("#phase"), rate = $("#rate");
-  dl.disabled = true; dl.textContent = "Working…";
+  dl.disabled = true; dl.textContent = "Working…"; dl.dataset.busy = "1";
   prog.classList.remove("hide"); fill.className = "fill"; fill.style.width = "0%";
 
   let job;
@@ -1124,7 +1389,9 @@ async function startDownload(url, extra){
         clearInterval(poll); poll = null;
         fill.classList.add("done"); fill.style.width = "100%";
         phase.textContent = "Done"; rate.textContent = "";
+        if (p.warning) setMsg('<span class="warn">⚠ ' + esc(p.warning) + '</span>');
         window.location = "/api/file/" + job;
+        delete dl.dataset.busy;
         dl.disabled = false; dl.textContent = "Download again";
       } else if (p.status === "error"){
         clearInterval(poll); poll = null; fail(p.error || "Download failed.");
@@ -1135,6 +1402,7 @@ async function startDownload(url, extra){
   function fail(m){
     fill.classList.add("err"); fill.style.width = "100%";
     phase.textContent = "Failed"; rate.textContent = "";
+    delete dl.dataset.busy;
     dl.disabled = false; dl.textContent = "Try again";
     setMsg("✗ " + m, true);
   }
