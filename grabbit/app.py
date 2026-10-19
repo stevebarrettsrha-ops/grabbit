@@ -66,6 +66,12 @@ FFMPEG_DIR = None  # set at startup: folder holding ffmpeg/ffprobe, or None (use
 
 app = Flask(__name__)
 
+# Every video Grabbit has downloaded, one "<site> <video id>" per line (yt-dlp's
+# download-archive format), so the same video is never fetched twice.
+HISTORY_FILE = APP_DIR / "download-history.txt"
+HISTORY_LOCK = threading.Lock()
+_ID_YDL = None  # a bare yt-dlp instance used only to work out history keys
+
 # In-memory job registry. Each job tracks the progress of one download.
 JOBS = {}
 JOBS_LOCK = threading.Lock()
@@ -138,6 +144,49 @@ def human_size(num):
         num /= 1024
 
 
+def _history():
+    """The set of videos already downloaded."""
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as fh:
+            return {line.strip() for line in fh if line.strip()}
+    except FileNotFoundError:
+        return set()
+
+
+def _history_key(d):
+    """yt-dlp's archive key ("youtube abc123") for a video, or None."""
+    global _ID_YDL
+    if not d:
+        return None
+    try:
+        if _ID_YDL is None:
+            _ID_YDL = yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True})
+        return _ID_YDL._make_archive_id(d)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _remember(infos):
+    """Add videos to the history (used when a re-download skipped yt-dlp's own record)."""
+    keys = [k for k in (_history_key(d) for d in infos) if k]
+    if not keys:
+        return
+    with HISTORY_LOCK:
+        have = _history()
+        with open(HISTORY_FILE, "a", encoding="utf-8") as fh:
+            for k in keys:
+                if k not in have:
+                    fh.write(k + "\n")
+                    have.add(k)
+
+
+def _has_media(job_dir):
+    return any(
+        p.is_file() and not p.name.endswith((".part", ".ytdl"))
+        for p in job_dir.iterdir()
+    )
+
+
 def _best_thumb(d):
     if not d:
         return None
@@ -181,6 +230,8 @@ def api_info():
     except Exception as exc:  # noqa: BLE001
         return jsonify(error=f"Unexpected error: {exc}"), 500
 
+    history = _history()
+
     # --- a playlist / channel ---
     if info.get("_type") == "playlist":
         entries = _flatten_entries(info.get("entries"))
@@ -201,7 +252,7 @@ def api_info():
             thumbnail=_best_thumb(first) or _best_thumb(info),
             first_title=first.get("title"),
             single_available=single_available,
-            entries=[_entry_summary(e, i) for i, e in enumerate(entries, 1)],
+            entries=[_entry_summary(e, i, history) for i, e in enumerate(entries, 1)],
             has_chapters=False,
             chapters=[],
         )
@@ -226,6 +277,7 @@ def api_info():
         thumbnail=info.get("thumbnail"),
         chapters=chapter_list,
         has_chapters=bool(chapter_list),
+        already_downloaded=_history_key(info) in history,
     )
 
 
@@ -252,9 +304,10 @@ def _small_thumb(e):
     return thumbs[-1]["url"] if thumbs else e.get("thumbnail")
 
 
-def _entry_summary(e, position):
+def _entry_summary(e, position, history=frozenset()):
     url = e.get("webpage_url") or e.get("url") or ""
     return {
+        "downloaded": _history_key(e) in history,
         # Number by place in the combined list; a channel's tabs each count from 1.
         "index": position,
         "url": url if re.match(r"^https?://", url, re.I) else "",
@@ -277,6 +330,7 @@ def api_download():
     scope = data.get("scope", "single")  # single | playlist
     playlist_count = int(data.get("playlist_count") or 0)
     filename = data.get("filename")  # only used for direct downloads
+    allow_repeat = bool(data.get("allow_repeat"))  # re-download videos already in the history
     if not url:
         return jsonify(error="Missing URL."), 400
     items = []
@@ -298,6 +352,9 @@ def api_download():
             "result_path": None,
             "download_name": None,
             "warning": None,
+            "got": [],  # list positions that finished (picked-videos downloads)
+            "already": [],  # picks skipped because they were downloaded before
+            "already_all": False,  # nothing fetched: everything was downloaded before
         }
         if scope == "selected" and data.get("title"):
             JOBS[job_id]["title"] = str(data["title"])
@@ -307,17 +364,18 @@ def api_download():
         args = (job_id, url, filename)
     elif scope == "selected":
         target = _run_selected
-        args = (job_id, url, items, mode, quality, codec)
+        args = (job_id, url, items, mode, quality, codec, allow_repeat)
     else:
         target = _run_download
-        args = (job_id, url, mode, quality, scope, playlist_count, codec)
+        args = (job_id, url, mode, quality, scope, playlist_count, codec, allow_repeat)
 
     thread = threading.Thread(target=target, args=args, daemon=True)
     thread.start()
     return jsonify(job_id=job_id)
 
 
-def _run_download(job_id, url, mode, quality, scope="single", playlist_count=0, codec="compatible"):
+def _run_download(job_id, url, mode, quality, scope="single", playlist_count=0,
+                  codec="compatible", allow_repeat=False):
     job_dir = DOWNLOAD_ROOT / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     is_playlist = scope == "playlist"
@@ -372,15 +430,25 @@ def _run_download(job_id, url, mode, quality, scope="single", playlist_count=0, 
     if FFMPEG_DIR:
         opts["ffmpeg_location"] = FFMPEG_DIR
 
+    if not allow_repeat:  # skip anything already downloaded, and record new ones
+        opts["download_archive"] = str(HISTORY_FILE)
     # Chapter-splitting only applies to a single video.
     _apply_media_opts(opts, mode, quality, codec, split_chapters=not is_playlist)
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(url, download=True) or {}  # empty if skipped as already downloaded
         title = info.get("title") or ("playlist" if is_playlist else "video")
         with JOBS_LOCK:
             JOBS[job_id]["title"] = title
+
+        if not _has_media(job_dir) and not allow_repeat:
+            with JOBS_LOCK:
+                JOBS[job_id]["already_all"] = True
+            _fail(job_id, "You've already downloaded this.")
+            return
+        if allow_repeat:
+            _remember(_flatten_entries(info.get("entries")) if is_playlist else [info])
 
         if codec == "force_h264" and mode != "audio":
             _force_h264_dir(job_id, job_dir)
@@ -431,7 +499,7 @@ def _clean_items(raw):
     return items
 
 
-def _run_selected(job_id, list_url, items, mode, quality, codec):
+def _run_selected(job_id, list_url, items, mode, quality, codec, allow_repeat=False):
     job_dir = DOWNLOAD_ROOT / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     total = len(items)
@@ -457,7 +525,7 @@ def _run_selected(job_id, list_url, items, mode, quality, codec):
             elif d["status"] == "finished":
                 job["phase"] = f"Processing video {n} of {total}…"
 
-    failed = []
+    failed, already = [], []
     for n, item in enumerate(items, 1):
         state["n"] = n
         with JOBS_LOCK:
@@ -486,23 +554,45 @@ def _run_selected(job_id, list_url, items, mode, quality, codec):
             opts["playlist_items"] = str(item["index"])
         if FFMPEG_DIR:
             opts["ffmpeg_location"] = FFMPEG_DIR
+        if not allow_repeat:
+            opts["download_archive"] = str(HISTORY_FILE)
         _apply_media_opts(opts, mode, quality, codec)
 
+        before = {p.name for p in job_dir.iterdir()}
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info(target, download=True)
+                info = ydl.extract_info(target, download=True)
         except Exception as exc:  # noqa: BLE001 — one bad video shouldn't stop the rest
             failed.append(item["title"] or f"video {n}")
             print(f"  ⚠  Skipped {item['title'] or target}: {_clean_err(exc)}")
+            continue
+        if {p.name for p in job_dir.iterdir()} - before:
+            if allow_repeat:
+                _remember([info])
+            with JOBS_LOCK:
+                JOBS[job_id]["got"].append(item["index"])
+        else:  # yt-dlp found it in the history and skipped it
+            already.append(item["title"] or f"video {n}")
+            with JOBS_LOCK:
+                JOBS[job_id]["already"].append(item)
 
-    if len(failed) == total:
+    if len(already) == total:
+        with JOBS_LOCK:
+            JOBS[job_id]["already_all"] = True
+        _fail(job_id, "You've already downloaded "
+                      + ("this video." if total == 1 else f"all {total} of these videos."))
+        return
+    if len(failed) + len(already) == total:
         _fail(job_id, "None of the chosen videos could be downloaded.")
         return
+    notes = []
+    if already:
+        notes.append(f"{len(already)} already downloaded before, so skipped.")
     if failed:
+        notes.append(f"{len(failed)} could not be downloaded.")
+    if notes:
         with JOBS_LOCK:
-            JOBS[job_id]["warning"] = (
-                f"{len(failed)} of {total} videos could not be downloaded and were skipped."
-            )
+            JOBS[job_id]["warning"] = " ".join(notes)
 
     if codec == "force_h264" and mode != "audio":
         _force_h264_dir(job_id, job_dir)
@@ -1012,6 +1102,14 @@ PAGE = r"""<!doctype html>
   .vrow .vn{width:34px}
   .vempty{padding:12px;text-align:center;color:var(--muted);font-size:12.5px}
   .warn{color:var(--accent2)}
+  .vrow .vbadge{display:none;font-family:"IBM Plex Mono",monospace;font-size:10.5px;color:var(--good);
+    border:1px solid rgba(167,201,87,.4);border-radius:999px;padding:1px 7px;flex:none}
+  .vrow.had .vbadge{display:inline}
+  .vrow.locked{opacity:.5;cursor:not-allowed}
+  .vrow.locked input{cursor:not-allowed}
+  .again{display:flex;gap:8px;align-items:center;font-size:13px;color:var(--muted);cursor:pointer}
+  .again input{accent-color:var(--accent);width:16px;height:16px;margin:0}
+  .pill.got{color:var(--good);border-color:rgba(167,201,87,.4)}
 
   .actions{border-top:1px solid var(--line);padding:16px;display:flex;gap:12px;align-items:center}
   .dl{padding:13px 24px;color:#1b1c18;background:linear-gradient(95deg,var(--accent),var(--accent2))}
@@ -1108,6 +1206,7 @@ function render(url, d){
           ${d.uploader ? `<span class="pill">${esc(d.uploader)}</span>`:""}
           ${d.duration ? `<span class="pill">⏱ ${d.duration}</span>`:""}
           ${d.has_chapters ? `<span class="pill">${d.chapters.length} chapters</span>`:""}
+          ${d.already_downloaded ? `<span class="pill got">✓ Already downloaded</span>`:""}
         </div>
       </div>
     </div>
@@ -1144,6 +1243,9 @@ function render(url, d){
         </div>
       </div>
     </div>
+    ${d.already_downloaded ? `
+    <div class="opts"><label class="again"><input type="checkbox" id="again">
+      You've downloaded this before. Download it again anyway</label></div>` : ""}
     ${chBlock}
     <div class="actions">
       <button class="dl" id="dl">Download</button>
@@ -1159,10 +1261,19 @@ function render(url, d){
     r.addEventListener("change", () => {
       qrow.classList.toggle("hide", document.querySelector('input[name=mode]:checked').value === "audio");
     }));
-  $("#dl").onclick = () => startDownload(url, {
+  const again = $("#again"), dl = $("#dl");
+  const lockIfHad = () => {
+    if (!again || dl.dataset.busy) return;
+    dl.disabled = !again.checked;
+    dl.textContent = again.checked ? "Download again" : "Already downloaded";
+  };
+  if (again) again.addEventListener("change", lockIfHad);
+  lockIfHad();
+  dl.onclick = () => startDownload(url, {
     mode: document.querySelector('input[name=mode]:checked').value,
     quality: $("#quality").value,
     codec: $("#codec").value,
+    allow_repeat: !!(again && again.checked),
   });
 }
 
@@ -1171,8 +1282,12 @@ function renderPlaylist(url, d){
   const entries = d.entries || [];
   // Small lists start fully ticked; big channels start empty so nothing huge
   // downloads by accident.
+  // Videos already in the download history are locked unless "download again" is ticked.
+  let again = false;
+  const canPick = i => again || !entries[i].downloaded;
+  const hadCount = entries.filter(e => e.downloaded).length;
   const startAll = entries.length <= 50;
-  const picked = new Set(startAll ? entries.map((_, i) => i) : []);
+  const picked = new Set(startAll ? entries.map((_, i) => i).filter(canPick) : []);
 
   const scopeBlock = d.single_available ? `
       <div>
@@ -1191,6 +1306,7 @@ function renderPlaylist(url, d){
         <span class="vn">${e.index}</span>
         ${e.thumbnail ? `<img src="${esc(e.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : `<span class="noimg"></span>`}
         <span class="vt" title="${esc(e.title)}">${esc(e.title)}</span>
+        <span class="vbadge">✓ Downloaded</span>
         <span class="vd">${e.duration || ""}</span>
       </label>`).join("");
 
@@ -1206,6 +1322,7 @@ function renderPlaylist(url, d){
           ${d.source ? `<span class="pill src">${esc(d.source)}</span>`:""}
           <span class="pill">&#9654; ${n} videos</span>
           ${d.uploader ? `<span class="pill">${esc(d.uploader)}</span>`:""}
+          <span class="pill got" id="hadpill"></span>
         </div>
       </div>
     </div>
@@ -1220,6 +1337,8 @@ function renderPlaylist(url, d){
           <span class="pcount" id="pcount"></span>
         </div>
         <div class="vlist" id="vlist">${rows || `<div class="vempty">No videos listed.</div>`}</div>
+        <label class="again" id="againrow"><input type="checkbox" id="again">
+          <span>Also allow videos I've already downloaded</span></label>
       </div>
       <div>
         <div class="label">What to grab</div>
@@ -1272,7 +1391,17 @@ function renderPlaylist(url, d){
   const visible = () => rowsEl.filter(r => r.style.display !== "none").map(r => +r.dataset.i);
 
   function refresh(){
-    boxes.forEach((b, i) => { b.checked = picked.has(i); rowsEl[i].classList.toggle("on", b.checked); });
+    boxes.forEach((b, i) => {
+      b.checked = picked.has(i);
+      b.disabled = !canPick(i);
+      rowsEl[i].classList.toggle("on", b.checked);
+      rowsEl[i].classList.toggle("had", !!entries[i].downloaded);
+      rowsEl[i].classList.toggle("locked", !canPick(i));
+    });
+    const had = entries.filter(e => e.downloaded).length;
+    $("#hadpill").textContent = had ? `✓ ${had} already downloaded` : "";
+    $("#hadpill").style.display = had ? "" : "none";
+    $("#againrow").style.display = had ? "" : "none";
     const k = picked.size;
     $("#pcount").textContent = `${k} of ${entries.length} selected`;
     const single = scopeNow() === "single";
@@ -1289,12 +1418,14 @@ function renderPlaylist(url, d){
     if (!row) return;
     ev.preventDefault();
     const i = +row.dataset.i;
+    if (!canPick(i)) return;
     const turnOn = !picked.has(i);
     if (ev.shiftKey && last !== null){
       const vis = visible();
       const a = vis.indexOf(last), b = vis.indexOf(i);
       if (a !== -1 && b !== -1){
-        vis.slice(Math.min(a, b), Math.max(a, b) + 1).forEach(j => turnOn ? picked.add(j) : picked.delete(j));
+        vis.slice(Math.min(a, b), Math.max(a, b) + 1).filter(canPick)
+          .forEach(j => turnOn ? picked.add(j) : picked.delete(j));
       }
     } else {
       turnOn ? picked.add(i) : picked.delete(i);
@@ -1308,7 +1439,12 @@ function renderPlaylist(url, d){
     rowsEl.forEach((r, i) => { r.style.display = !q || entries[i].title.toLowerCase().includes(q) ? "" : "none"; });
   });
   // "Select all" / "Clear" act on what the search is currently showing.
-  $("#vall").onclick = () => { visible().forEach(i => picked.add(i)); refresh(); };
+  $("#vall").onclick = () => { visible().filter(canPick).forEach(i => picked.add(i)); refresh(); };
+  $("#again").addEventListener("change", ev => {
+    again = ev.target.checked;
+    if (!again) entries.forEach((e, i) => { if (e.downloaded) picked.delete(i); });
+    refresh();
+  });
   $("#vnone").onclick = () => { visible().forEach(i => picked.delete(i)); refresh(); };
   document.querySelectorAll('input[name=scope]').forEach(r => r.addEventListener("change", refresh));
 
@@ -1323,18 +1459,28 @@ function renderPlaylist(url, d){
       mode: document.querySelector('input[name=mode]:checked').value,
       quality: $("#quality").value,
       codec: $("#codec").value,
+      allow_repeat: again,
     };
     if (scopeNow() === "single") return startDownload(url, {...base, scope: "single"});
     const chosen = [...picked].sort((a, b) => a - b).map(i => entries[i]);
     if (!chosen.length) return;
     // Everything ticked: grab the list in one go, as before.
     if (chosen.length === entries.length && entries.length === n)
-      return startDownload(url, {...base, scope: "playlist", playlist_count: n});
+      return startDownload(url, {...base, scope: "playlist", playlist_count: n}, () => markHad(entries.map(e => e.index)));
     startDownload(url, {
       ...base, scope: "selected", title: d.title,
       items: chosen.map(e => ({url: e.url, index: e.index, title: e.title})),
-    });
+    }, p => markHad(p.got || []));
   };
+
+  // After a download, show the new videos as downloaded and untick them.
+  function markHad(indexes){
+    indexes.forEach(ix => {
+      const i = entries.findIndex(e => e.index === ix);
+      if (i !== -1){ entries[i].downloaded = true; if (!again) picked.delete(i); }
+    });
+    refresh();
+  }
 
   refresh();
 }
@@ -1364,7 +1510,12 @@ function renderDirect(url, d){
   $("#dl").onclick = () => startDownload(url, {mode:"direct", filename:d.filename});
 }
 
-async function startDownload(url, extra){
+function offerAgain(text, label, go){
+  setMsg('<span class="warn">' + esc(text) + '</span> <button class="ghost" id="againbtn">' + esc(label) + '</button>');
+  $("#againbtn").onclick = () => { setMsg(""); go(); };
+}
+
+async function startDownload(url, extra, onDone){
   const dl = $("#dl"), prog = $("#prog"), fill = $("#fill"), phase = $("#phase"), rate = $("#rate");
   dl.disabled = true; dl.textContent = "Working…"; dl.dataset.busy = "1";
   prog.classList.remove("hide"); fill.className = "fill"; fill.style.width = "0%";
@@ -1390,11 +1541,24 @@ async function startDownload(url, extra){
         fill.classList.add("done"); fill.style.width = "100%";
         phase.textContent = "Done"; rate.textContent = "";
         if (p.warning) setMsg('<span class="warn">⚠ ' + esc(p.warning) + '</span>');
+        // Some picks were skipped as already downloaded: offer to fetch them too.
+        if (p.already && p.already.length)
+          offerAgain(`${p.already.length} of these you'd already downloaded, so they were skipped.`,
+            `Download ${p.already.length === 1 ? "it" : "those " + p.already.length} again`,
+            () => startDownload(url, {...extra, scope: "selected", items: p.already, allow_repeat: true}, onDone));
         window.location = "/api/file/" + job;
         delete dl.dataset.busy;
         dl.disabled = false; dl.textContent = "Download again";
+        if (onDone) onDone(p);
       } else if (p.status === "error"){
-        clearInterval(poll); poll = null; fail(p.error || "Download failed.");
+        clearInterval(poll); poll = null;
+        if (p.already_all){
+          // Nothing new: everything was downloaded before. Let the user choose.
+          fill.style.width = "0%"; phase.textContent = "Skipped — already downloaded"; rate.textContent = "";
+          delete dl.dataset.busy; dl.disabled = false; dl.textContent = "Download";
+          offerAgain(p.error + " Download it again anyway?", "Download again",
+            () => startDownload(url, {...extra, allow_repeat: true}, onDone));
+        } else fail(p.error || "Download failed.");
       }
     }catch(e){ clearInterval(poll); poll = null; fail(e.message); }
   }, 700);

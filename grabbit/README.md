@@ -15,6 +15,12 @@ It also handles the wider web:
   `https://www.youtube.com/@name`) or a playlist link and Grabbit lists every
   video in it. Tick the ones you want (search by title, *Select all* / *Clear*,
   or shift-click to tick a range), then download them all at once as one `.zip`.
+- **Never the same video twice** — Grabbit remembers every video it has
+  downloaded. Next time you open that channel, those videos are marked
+  **✓ Downloaded** and left unticked, and they're skipped if you try again.
+  You always get the choice: tick *Also allow videos I've already downloaded*
+  (or *Download it again anyway* for a single video), or press the
+  **Download again** button Grabbit shows when it skips something.
 - **Any page with an embedded video** — even sites without a dedicated
   extractor are scanned by yt-dlp's generic detector.
 - **Direct media links** — paste a raw `https://site.com/clip.mp4` (or `.webm`,
@@ -62,6 +68,7 @@ Grabbit keeps itself self-contained in its own folder:
 | `.venv/`     | Flask, yt-dlp and their Python dependencies |
 | `bin/`       | the bundled `ffmpeg` / `ffprobe` |
 | `downloads/` | finished files (also delivered to your browser) |
+| `download-history.txt` | every video you've downloaded, so it isn't fetched twice — delete it to start fresh |
 
 Deleting these folders resets it; deleting the whole `grabbit` folder removes
 it entirely. The one thing kept outside the folder is the base **Python**
