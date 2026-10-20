@@ -24,6 +24,8 @@ if [ -z "${GRABBIT_IN_TERMINAL:-}" ] && [ ! -t 0 ] && [ ! -t 1 ] \
       *) "$term" -e bash "$SELF" && exit 0 ;;
     esac
   done
+  # No window opened: this run carries on here, so it is not one.
+  unset GRABBIT_IN_TERMINAL
   # No terminal found: carry on without one. The browser tab still opens.
 fi
 
