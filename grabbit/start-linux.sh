@@ -7,11 +7,12 @@ cd "$(dirname "$0")" || exit 1
 # "Run as a Program" gives no terminal: nothing below could be seen, and a
 # failure would just look like nothing happening. On a desktop, re-run this
 # script inside a terminal window instead.
-# A systemd service (it sets INVOCATION_ID), or anything run with
-# GRABBIT_NO_TERMINAL=1, stays where it was started.
+# Anything run with GRABBIT_NO_TERMINAL=1 (a service, an IDE task) stays
+# where it was started. Not INVOCATION_ID: a file manager that runs as
+# a systemd service hands it to everything it starts.
 if [ -z "${GRABBIT_IN_TERMINAL:-}" ] && [ ! -t 0 ] && [ ! -t 1 ] \
    && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] \
-   && [ -z "${INVOCATION_ID:-}${GRABBIT_NO_TERMINAL:-}" ]; then
+   && [ -z "${GRABBIT_NO_TERMINAL:-}" ]; then
   export GRABBIT_IN_TERMINAL=1
   SELF="$(pwd)/$(basename "$0")"
   for term in gnome-terminal ptyxis kgx konsole xfce4-terminal mate-terminal \
