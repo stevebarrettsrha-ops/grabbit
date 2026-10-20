@@ -1,7 +1,40 @@
 #!/bin/bash
 # Run Grabbit on Linux.  In a terminal:  ./start-linux.sh
-# (Some file managers can also run it on double-click, choosing "Run".)
+# From the file manager: right-click it -> "Run as a Program".
 cd "$(dirname "$0")" || exit 1
+
+# --- started from the file manager? open a terminal to run in --------------
+# "Run as a Program" gives no terminal: nothing below could be seen, and a
+# failure would just look like nothing happening. On a desktop, re-run this
+# script inside a terminal window instead.
+if [ -z "${GRABBIT_IN_TERMINAL:-}" ] && [ ! -t 0 ] && [ ! -t 1 ] \
+   && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+  export GRABBIT_IN_TERMINAL=1
+  SELF="$(pwd)/$(basename "$0")"
+  for term in gnome-terminal ptyxis kgx konsole xfce4-terminal mate-terminal \
+              tilix x-terminal-emulator xterm; do
+    command -v "$term" >/dev/null 2>&1 || continue
+    case "$term" in
+      gnome-terminal|ptyxis|kgx) "$term" -- bash "$SELF" && exit 0 ;;
+      xfce4-terminal|mate-terminal) "$term" -x bash "$SELF" && exit 0 ;;
+      *) "$term" -e bash "$SELF" && exit 0 ;;
+    esac
+  done
+  # No terminal found: carry on without one. The browser tab still opens.
+fi
+
+# In a window we opened, keep it open if Grabbit stops with an error, so the
+# reason can be read. (The setup steps below already pause on their own.)
+press_enter() { PAUSED=1; read -r -p "  Press Enter to close."; }
+pause_on_error() {
+  code=$?
+  if [ -n "${GRABBIT_IN_TERMINAL:-}" ] && [ -z "${PAUSED:-}" ] && [ -t 0 ] \
+     && [ "$code" -ne 0 ] && [ "$code" -ne 130 ]; then
+    echo
+    read -r -p "  Grabbit stopped (exit code $code). Press Enter to close." || true
+  fi
+}
+trap pause_on_error EXIT
 echo
 echo "  Setting up Grabbit..."
 echo
@@ -27,18 +60,28 @@ else
     echo "  [X] Could not install Python automatically."
     echo "      Install python3 (and python3-venv) with your package manager,"
     echo "      then run this launcher again."
-    read -r -p "  Press Enter to close."
+    press_enter
     exit 1
   fi
 fi
 
 # --- create a self-contained environment on first run ----------------------
+# Check for pip, not just a Python: on Debian/Ubuntu without python3-venv,
+# venv dies after writing .venv/bin/python but before pip, and keeping that
+# half-built folder made every later run fail with "No module named pip".
+if [ -e ".venv" ] && ! ".venv/bin/python" -c "import pip" >/dev/null 2>&1; then
+  echo "  The local environment is incomplete. Building it again..."
+  rm -rf .venv
+fi
 if [ ! -x ".venv/bin/python" ]; then
   echo "  Creating local environment (first run only)..."
   if ! "$PY" -m venv .venv; then
+    rm -rf .venv
     echo "  [X] Could not create the environment."
-    echo "      On Debian/Ubuntu you may need:  sudo apt install python3-venv"
-    read -r -p "  Press Enter to close."
+    echo "      On Debian/Ubuntu install the venv module first:"
+    echo "        sudo apt-get install -y python3-venv"
+    echo "      then run this launcher again."
+    press_enter
     exit 1
   fi
 fi
@@ -65,7 +108,7 @@ fi
 if ! "$VENV_PY" -c "import yt_dlp" >/dev/null 2>&1; then
   echo "  [X] yt-dlp could not be installed. Check your internet connection,"
   echo "      then run this launcher again."
-  read -r -p "  Press Enter to close."
+  press_enter
   exit 1
 fi
 
