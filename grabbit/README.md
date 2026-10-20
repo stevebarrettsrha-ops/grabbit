@@ -40,7 +40,7 @@ Just open the launcher for your system:
 |---------|---------------------|
 | Windows | **`start-windows.bat`** |
 | macOS   | **`start-mac.command`** |
-| Linux   | **`start-linux.sh`** (or run `./start-linux.sh` in a terminal) |
+| Linux   | right-click **`start-linux.sh`** → **Run as a Program** (or run `./start-linux.sh` in a terminal) |
 
 On the first run the launcher checks for everything it needs and sets it up:
 
@@ -75,6 +75,14 @@ it entirely. The one thing kept outside the folder is the base **Python**
 interpreter itself — it's what runs the launcher in the first place, so it lives
 where you (or the launcher) installed it. Everything Grabbit pulls in afterward
 stays in the folder.
+
+> **Linux note:** double-clicking `start-linux.sh` in the file manager opens it
+> in a text editor — use right-click → **Run as a Program**; it opens a
+> terminal window to run in. If a terminal says `Permission denied` (unzipping
+> can drop the executable bit), run `bash start-linux.sh`, or
+> `chmod +x start-linux.sh` once. On Debian and Ubuntu the first run also needs
+> `sudo apt-get install -y python3-venv`; the launcher says so when it's
+> missing, and picks up where it stopped once it's installed.
 
 > **macOS note:** the first time you open `start-mac.command`, macOS may block
 > it. Right-click it → **Open** → **Open**, and it'll remember your choice. If
