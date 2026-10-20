@@ -7,8 +7,12 @@ cd "$(dirname "$0")" || exit 1
 # "Run as a Program" gives no terminal: nothing below could be seen, and a
 # failure would just look like nothing happening. On a desktop, re-run this
 # script inside a terminal window instead.
+# Anything run with GRABBIT_NO_TERMINAL=1 (a service, an IDE task) stays
+# where it was started. Not INVOCATION_ID: a file manager that runs as
+# a systemd service hands it to everything it starts.
 if [ -z "${GRABBIT_IN_TERMINAL:-}" ] && [ ! -t 0 ] && [ ! -t 1 ] \
-   && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+   && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] \
+   && [ -z "${GRABBIT_NO_TERMINAL:-}" ]; then
   export GRABBIT_IN_TERMINAL=1
   SELF="$(pwd)/$(basename "$0")"
   for term in gnome-terminal ptyxis kgx konsole xfce4-terminal mate-terminal \
@@ -20,6 +24,8 @@ if [ -z "${GRABBIT_IN_TERMINAL:-}" ] && [ ! -t 0 ] && [ ! -t 1 ] \
       *) "$term" -e bash "$SELF" && exit 0 ;;
     esac
   done
+  # No window opened: this run carries on here, so it is not one.
+  unset GRABBIT_IN_TERMINAL
   # No terminal found: carry on without one. The browser tab still opens.
 fi
 
@@ -117,4 +123,11 @@ echo "  Starting Grabbit. ffmpeg will be set up inside ./bin on first run."
 echo "  A browser tab will open at http://127.0.0.1:8080"
 echo "  Press Ctrl+C to stop."
 echo
-"$VENV_PY" app.py
+# The server takes this script's place (exec), so whatever stops the
+# script stops the server. Only in a window this script opened does
+# the shell stay, so the trap above can keep a failure on screen.
+if [ -n "${GRABBIT_IN_TERMINAL:-}" ]; then
+  "$VENV_PY" app.py
+else
+  exec "$VENV_PY" app.py
+fi
