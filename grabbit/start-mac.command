@@ -29,15 +29,23 @@ else
 fi
 
 # --- create a self-contained environment on first run ----------------------
-if [ ! -x ".venv/bin/python" ]; then
+# A folder first set up on Windows (a shared drive) carries a Windows .venv:
+# Scripts/python.exe and no bin/python. Building over it would break Grabbit
+# on Windows, so this system gets its own environment beside it.
+VENV=.venv
+if [ -e ".venv/Scripts/python.exe" ] && [ ! -e ".venv/bin/python" ]; then
+  VENV=".venv-darwin"
+  echo "  .venv was set up on Windows; leaving it as it is and using $VENV here."
+fi
+if [ ! -x "$VENV/bin/python" ]; then
   echo "  Creating local environment (first run only)..."
-  "$PY" -m venv .venv || {
+  "$PY" -m venv "$VENV" || {
     echo "  [X] Could not create the environment."
     read -r -p "  Press Return to close."
     exit 1
   }
 fi
-VENV_PY=".venv/bin/python"
+VENV_PY="$VENV/bin/python"
 
 # --- install / verify dependencies -----------------------------------------
 echo "  Checking dependencies (first run may take a minute)..."

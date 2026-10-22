@@ -72,17 +72,26 @@ else
 fi
 
 # --- create a self-contained environment on first run ----------------------
+# A folder first set up on Windows (a drive both systems share) carries a
+# Windows .venv: Scripts/python.exe and no bin/python. It can never run here,
+# and deleting or rebuilding it would break Grabbit on Windows, so this
+# system gets its own environment beside it (.venv-linux).
+VENV=.venv
+if [ -e ".venv/Scripts/python.exe" ] && [ ! -e ".venv/bin/python" ]; then
+  VENV=".venv-$(uname -s | tr '[:upper:]' '[:lower:]')"
+  echo "  .venv was set up on Windows; leaving it as it is and using $VENV here."
+fi
 # Check for pip, not just a Python: on Debian/Ubuntu without python3-venv,
 # venv dies after writing .venv/bin/python but before pip, and keeping that
 # half-built folder made every later run fail with "No module named pip".
-if [ -e ".venv" ] && ! ".venv/bin/python" -c "import pip" >/dev/null 2>&1; then
+if [ -e "$VENV" ] && ! "$VENV/bin/python" -c "import pip" >/dev/null 2>&1; then
   echo "  The local environment is incomplete. Building it again..."
-  rm -rf .venv
+  rm -rf "$VENV"
 fi
-if [ ! -x ".venv/bin/python" ]; then
+if [ ! -x "$VENV/bin/python" ]; then
   echo "  Creating local environment (first run only)..."
-  if ! "$PY" -m venv .venv; then
-    rm -rf .venv
+  if ! "$PY" -m venv "$VENV"; then
+    rm -rf "$VENV"
     echo "  [X] Could not create the environment."
     echo "      On Debian/Ubuntu install the venv module first:"
     echo "        sudo apt-get install -y python3-venv"
@@ -91,7 +100,7 @@ if [ ! -x ".venv/bin/python" ]; then
     exit 1
   fi
 fi
-VENV_PY=".venv/bin/python"
+VENV_PY="$VENV/bin/python"
 
 # --- install / verify dependencies -----------------------------------------
 echo "  Checking dependencies (first run may take a minute)..."

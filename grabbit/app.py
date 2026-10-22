@@ -674,8 +674,10 @@ def _fail(job_id, message):
 def _tool(name):
     """Path to ffmpeg/ffprobe, preferring the bundled copy in ./bin."""
     exe = name + (".exe" if os.name == "nt" else "")
-    if FFMPEG_DIR and (Path(FFMPEG_DIR) / exe).exists():
-        return str(Path(FFMPEG_DIR) / exe)
+    if FFMPEG_DIR:
+        cand = Path(FFMPEG_DIR) / exe
+        if cand.exists() and not foreign_binary(cand):
+            return str(cand)
     return name  # fall back to PATH
 
 
@@ -866,6 +868,49 @@ def _run_direct(job_id, url, filename):
 # --------------------------------------------------------------------------- #
 _FFMPEG_BASE = "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/"
 
+_ELF = b"\x7fELF"
+_MACHO = (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe",
+          b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce", b"\xca\xfe\xba\xbe")
+
+
+def foreign_binary(path):
+    """Is this an executable built for another operating system?
+
+    The grabbit folder can sit on a drive shared by Windows, Linux and macOS,
+    and ./bin then carries whichever system's ffmpeg was fetched first. Linux
+    and macOS both call theirs plain `ffmpeg`, so an existence check trusts
+    the other one's, and every run of it fails with `[Errno 8] Exec format
+    error`. The first bytes say which system a binary is for; anything
+    unreadable or unrecognised counts as native — this only ever rules out
+    what is plainly foreign.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+    except OSError:
+        return False
+    system = platform.system()
+    if head[:2] == b"MZ":
+        return system != "Windows"
+    if head == _ELF:
+        return system not in ("Linux", "FreeBSD")
+    if head in _MACHO:
+        return system != "Darwin"
+    return False
+
+
+def _bin_dir():
+    """Where this system's bundled ffmpeg lives.
+
+    ./bin, unless the ffmpeg already there was built for another system. That
+    copy is left alone (it is the other system's working tool) and this one
+    gets ./bin/<system> instead, e.g. ./bin/linux.
+    """
+    exe = "ffmpeg" + (".exe" if os.name == "nt" else "")
+    if foreign_binary(BIN_DIR / exe):
+        return BIN_DIR / platform.system().lower()
+    return BIN_DIR
+
 
 def _download_to(url, dest):
     req = urllib.request.Request(url, headers={"User-Agent": UA})
@@ -873,13 +918,13 @@ def _download_to(url, dest):
         shutil.copyfileobj(r, fh)
 
 
-def _extract_binaries(archive, kind, names):
-    """Pull just the named binaries out of a downloaded archive into BIN_DIR."""
+def _extract_binaries(archive, kind, names, dest):
+    """Pull just the named binaries out of a downloaded archive into dest."""
     if kind == "zip":
         with zipfile.ZipFile(archive) as z:
             for member in z.namelist():
                 if posixpath.basename(member) in names and not member.endswith("/"):
-                    with z.open(member) as src, open(BIN_DIR / posixpath.basename(member), "wb") as out:
+                    with z.open(member) as src, open(dest / posixpath.basename(member), "wb") as out:
                         shutil.copyfileobj(src, out)
     else:  # tar (.xz / .gz)
         with tarfile.open(archive) as t:
@@ -887,21 +932,21 @@ def _extract_binaries(archive, kind, names):
                 if member.isfile() and os.path.basename(member.name) in names:
                     src = t.extractfile(member)
                     if src:
-                        with open(BIN_DIR / os.path.basename(member.name), "wb") as out:
+                        with open(dest / os.path.basename(member.name), "wb") as out:
                             shutil.copyfileobj(src, out)
 
 
-def _fetch_ffmpeg():
-    """Download a static ffmpeg+ffprobe for this platform into ./bin."""
+def _fetch_ffmpeg(dest):
+    """Download a static ffmpeg+ffprobe for this platform into dest."""
     system = platform.system()
     machine = platform.machine().lower()
 
     if system == "Darwin":
         # No yt-dlp/BtbN macOS build; use evermeet's static binaries.
         for name in ("ffmpeg", "ffprobe"):
-            tmp = BIN_DIR / f"{name}.zip"
+            tmp = dest / f"{name}.zip"
             _download_to(f"https://evermeet.cx/ffmpeg/getrelease/{name}/zip", tmp)
-            _extract_binaries(tmp, "zip", {name})
+            _extract_binaries(tmp, "zip", {name}, dest)
             tmp.unlink(missing_ok=True)
         return
 
@@ -915,9 +960,9 @@ def _fetch_ffmpeg():
         raise RuntimeError(f"no bundled ffmpeg build for {system}/{machine}")
 
     ext = ".zip" if kind == "zip" else ".tar.xz"
-    tmp = BIN_DIR / f"ffmpeg-download{ext}"
+    tmp = dest / f"ffmpeg-download{ext}"
     _download_to(url, tmp)
-    _extract_binaries(tmp, kind, names)
+    _extract_binaries(tmp, kind, names, dest)
     tmp.unlink(missing_ok=True)
 
 
@@ -925,17 +970,22 @@ def ensure_ffmpeg():
     """Prefer a copy of ffmpeg in ./bin; download one there if none is available."""
     global FFMPEG_DIR
     suffix = ".exe" if os.name == "nt" else ""
-    local = BIN_DIR / f"ffmpeg{suffix}"
+    bin_dir = _bin_dir()
+    local = bin_dir / f"ffmpeg{suffix}"
+    if bin_dir != BIN_DIR:
+        print(f"  The ffmpeg in ./bin was built for another operating system;"
+              f" leaving it as it is and using ./bin/{bin_dir.name} here.")
 
-    if local.exists():
-        FFMPEG_DIR = str(BIN_DIR)
+    if local.exists() and not foreign_binary(local):
+        FFMPEG_DIR = str(bin_dir)
     elif shutil.which("ffmpeg") and shutil.which("ffprobe"):
         return  # a system ffmpeg is already available; leave it
     else:
-        BIN_DIR.mkdir(exist_ok=True)
-        print("  Setting up ffmpeg inside ./bin (one-time download, ~40 MB)...")
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  Setting up ffmpeg inside ./{bin_dir.relative_to(APP_DIR).as_posix()}"
+              " (one-time download, ~40 MB)...")
         try:
-            _fetch_ffmpeg()
+            _fetch_ffmpeg(bin_dir)
         except Exception as exc:  # noqa: BLE001
             print(f"  ⚠  Could not bundle ffmpeg ({exc}).")
             print("     Grabbit still runs; some quality/audio/chapter features need ffmpeg.\n")
@@ -943,14 +993,14 @@ def ensure_ffmpeg():
         if not local.exists():
             print("  ⚠  ffmpeg download did not produce the expected files.\n")
             return
-        for f in BIN_DIR.iterdir():
+        for f in bin_dir.iterdir():
             if f.is_file():
                 try:
                     f.chmod(0o755)
                 except OSError:
                     pass
-        FFMPEG_DIR = str(BIN_DIR)
-        print("  ffmpeg is ready in ./bin.\n")
+        FFMPEG_DIR = str(bin_dir)
+        print(f"  ffmpeg is ready in ./{bin_dir.relative_to(APP_DIR).as_posix()}.\n")
 
     # Make the bundled tools discoverable to any subprocess too.
     if FFMPEG_DIR:
