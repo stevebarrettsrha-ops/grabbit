@@ -70,6 +70,15 @@ Grabbit keeps itself self-contained in its own folder:
 | `downloads/` | finished files (also delivered to your browser) |
 | `download-history.txt` | every video you've downloaded, so it isn't fetched twice — delete it to start fresh |
 
+**One folder, several systems.** The `grabbit` folder can live on a drive
+shared by Windows, Linux and macOS. Each system keeps its own environment and
+tools there and leaves the others' alone: if `.venv` was made on Windows, Linux
+uses `.venv-linux` (macOS `.venv-darwin`, Windows `.venv-windows` for one made
+elsewhere), and if `bin/ffmpeg` belongs to another system this one fetches its
+own into `bin/linux` (or `bin/darwin`). Grabbit tells a binary's system by its
+first bytes, so another system's file is never run — that would only fail with
+`Exec format error`.
+
 Deleting these folders resets it; deleting the whole `grabbit` folder removes
 it entirely. The one thing kept outside the folder is the base **Python**
 interpreter itself — it's what runs the launcher in the first place, so it lives
@@ -150,6 +159,12 @@ The **Format** choice controls codecs:
 
 Finished files are also kept under `downloads/<job-id>/` next to `app.py`,
 so you can clear that folder anytime.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests
+```
 
 ## Notes
 

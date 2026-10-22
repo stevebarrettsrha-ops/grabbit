@@ -50,16 +50,24 @@ if not defined PY (
 )
 
 rem --- create a self-contained environment on first run -----------------
-if not exist ".venv\Scripts\python.exe" (
+rem A folder first set up on Linux or macOS (a drive both systems share)
+rem carries their .venv: bin/python and no Scripts\python.exe. Building over
+rem it would break Grabbit there, so Windows gets its own beside it.
+set "VENV=.venv"
+if exist ".venv\bin\python" if not exist ".venv\Scripts\python.exe" (
+  set "VENV=.venv-windows"
+  echo   .venv was set up on another system; leaving it as it is and using .venv-windows here.
+)
+if not exist "%VENV%\Scripts\python.exe" (
   echo   Creating local environment ^(first run only^)...
-  %PY% -m venv .venv
+  %PY% -m venv "%VENV%"
   if errorlevel 1 (
     echo   [X] Could not create the environment. Is Python installed correctly?
     pause
     exit /b 1
   )
 )
-set "VENV_PY=.venv\Scripts\python.exe"
+set "VENV_PY=%VENV%\Scripts\python.exe"
 
 rem --- upgrade pip (quiet, non-fatal) -----------------------------------
 "%VENV_PY%" -m pip install --quiet --upgrade pip 1>nul 2>nul
